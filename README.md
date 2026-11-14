@@ -80,3 +80,44 @@ official upstream PyPI release. The import name is `utae`.
 Reference: Sainte Fare Garnot and Landrieu, Panoptic Segmentation of Satellite
 Image Time Series with Convolutional Temporal Attention Networks, ICCV 2021.
 https://arxiv.org/abs/2107.07933
+
+## Baseline evaluation
+
+Run `test.ipynb` in the GPU environment. Install its small optional dependencies
+with `python -m pip install -r requirements-baselines.txt`. It loads local
+`baseline_1.pt` and `data/baselines/wsts_fold1.pt`; inference does not download weights.
+The one-time `python wsts_baseline.py --download` command retrieves only 55
+original WSTS daily rasters (189 MB transferred), skips completed files, and
+refuses servers that ignore byte-range requests. Inputs are already downloaded
+on this machine.
+
+The comparison uses the intersection of the frozen validation list and the three
+2020 fires in `wsts_manifest.json`: 43 one-day forecasts from day 6 onward. All
+models are scored on exactly the same native TS-SatFire pixels and dates. WSTS
+archives cover 26–31% of these maps, so results in
+`data/evaluation/wsts_overlap/` are a separate subset comparison and do not
+replace the full 11-fire history-length results. Neither input maps nor targets
+are downscaled. WSTS uses original archived input measurements; our model uses
+TS-SatFire measurements.
+
+`wsts_proxy` learns active-fire forecasts only. Its extra outputs are explicitly
+derived: `new = (1 - previous_burned) * predicted_active`,
+`burned = previous_burned + new`. The previous burned map is observed through
+issuance. These are proxies, not native WSTS burned-area outputs. DailyWildfireCAN
+is excluded because required Canadian layers do not cover these US fires; no
+compatible independent burned-area checkpoint has yet been substituted.
+
+AP is averaged per fire; IoU pools pixel counts at threshold 0.5. All history
+lengths use the same target dates. Our memory is warmed from day 2 and reset
+between fires and independent history-policy runs. The WSTS checkpoint was
+trained with five observations, so its other lengths test extrapolation.
+No new reserved test fires are used.
+
+WSTS code and statistics: https://github.com/slahrichi/WildfireSpreadTS
+commit `ed221d491fe2142a4b2e93462c2c0b7a1c7c31ad`. The fold-1 checkpoint
+trained on 2018/2019, validated on 2021, and tested on 2020. Backbone source
+is included in `wsts_backbones/` with its MIT license. Original input archive:
+https://doi.org/10.5281/zenodo.8006177.
+
+Released WSTS weights: https://huggingface.co/saadlahrichi/WSTSPlus/blob/main/trained_model_weights/Res18UTAE_T5/All/fold1_testAP0.420.pth
+Save this file locally as `data/baselines/wsts_fold1.pt`.
