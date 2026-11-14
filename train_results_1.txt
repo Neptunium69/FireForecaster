@@ -1,0 +1,78 @@
+Epoch 1/30:
+train loss: 0.6397
+val loss: 0.3276
+Epoch 2/30:
+train loss: 0.2224
+val loss: 0.1455
+Epoch 3/30:
+train loss: 0.1118
+val loss: 0.0820
+Epoch 4/30:
+train loss: 0.0688
+val loss: 0.0544
+Epoch 5/30:
+train loss: 0.0474
+val loss: 0.0515
+Saved checkpoints/epoch_005.pt
+Epoch 6/30:
+train loss: 0.0361
+val loss: 0.0281
+Epoch 7/30:
+train loss: 0.0288
+val loss: 0.0210
+Epoch 8/30:
+train loss: 0.0251
+val loss: 0.0229
+Early stopping: 1/7 epochs without improvement.
+Epoch 9/30:
+train loss: 0.0194
+val loss: 0.0155
+Epoch 10/30:
+train loss: 0.0211
+val loss: 0.0146
+Early stopping: 1/7 epochs without improvement.
+Saved checkpoints/epoch_010.pt
+Epoch 11/30:
+train loss: 0.0164
+val loss: 0.0133
+Epoch 12/30:
+train loss: 0.0153
+val loss: 0.0107
+Epoch 13/30:
+train loss: 0.0154
+val loss: 0.0126
+Early stopping: 1/7 epochs without improvement.
+Epoch 14/30:
+train loss: 0.0138
+val loss: 0.0094
+Epoch 15/30:
+train loss: 0.0162
+val loss: 0.0087
+Early stopping: 1/7 epochs without improvement.
+Saved checkpoints/epoch_015.pt
+Epoch 16/30:
+train loss: 0.0164
+val loss: 0.0102
+Early stopping: 2/7 epochs without improvement.
+Epoch 17/30:
+train loss: 0.0132
+val loss: 0.0100
+Early stopping: 3/7 epochs without improvement.
+Epoch 18/30:
+train loss: 0.0133
+val loss: 0.0092
+Early stopping: 4/7 epochs without improvement.
+Epoch 19/30:
+train loss: 0.0125
+val loss: 0.0154
+Early stopping: 5/7 epochs without improvement.
+Epoch 20/30:
+train loss: 0.0170
+val loss: 0.0085
+Early stopping: 6/7 epochs without improvement.
+Saved checkpoints/epoch_020.pt
+Epoch 21/30:
+train loss: 0.0129
+val loss: 0.0099
+Early stopping: 7/7 epochs without improvement.
+Early stopped.

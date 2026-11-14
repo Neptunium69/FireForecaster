@@ -28,9 +28,43 @@ before setup. Minimum dependency versions are specified, not a complete lockfile
 
 ## Model
 
-`FireHistoryEncoder` accepts `[batch, time, channels, height, width]` history and
-`[batch, time]` day offsets. It returns `[batch, 32, height, width]` features.
-Forecast heads and training remain to be implemented.
+`FireHistoryEncoder` uses U-TAE's spatial encoder and temporal attention only.
+It returns a 128-channel temporal bottleneck and three temporally aggregated
+skip maps (64, 32, 32 channels, coarse to fine). Its built-in decoder is discarded.
+Padded observations are excluded from temporal normalization as well as attention.
+
+`UNetDecoder` is a separate, trainable decoder. It upsamples to each skip map's
+actual dimensions and returns `[batch, 32, height, width]` features, including for
+odd and rectangular inputs. Add the active-fire and burn-growth heads to these
+features; those heads and the training loop remain to be implemented.
+
+```python
+from model import FireForecast, MemoryAdapter
+
+adapter = MemoryAdapter(
+    high=1.0, low=-1.0, dims=3, size=4096, device="cuda",
+    shape={"encoder": 512}, steps=8,
+)
+model = FireForecast(input_channels=12, memory_adapter=adapter).cuda()
+adapter.reset_memory()  # Start of an independent fire sequence
+features = model(history, dates)
+```
+
+`history` is `[B,T,C,H,W]`, with H and W at least 16. `dates` is `[B,T]`.
+ALPACA's current memory supports B=1. The encoder/decoder alone supports larger
+batches: use `FireForecast(input_channels=12)` without an adapter.
+
+The memory adapter compresses the 128-channel bottleneck into 512 values, runs
+feedback-controlled memory steps, and fuses the resulting readout back into the
+bottleneck before decoding. State persists across calls. Reset between independent
+fires; call `adapter.detach_memory()` at truncated-backpropagation boundaries.
+Memory dynamics currently use FP32; mixed-precision training has not been validated.
+ALPACA's development package must also be installed in the training environment.
+
+GPU checks covered odd-size reconstruction, temporal padding, decoder gradients
+through all skips, and an eight-turn 4096-neuron memory forward pass. Full-network
+backward remains unverified; the earlier environment check found a missing C
+compiler required by the installed PyTorch/Triton backward path.
 
 ## Upstream attribution
 
