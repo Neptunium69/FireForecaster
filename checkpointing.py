@@ -12,7 +12,7 @@ SPATIAL_CHECKPOINT_DIR = CHECKPOINT_DIR / "spatial"
 
 
 def spatial_checkpoint_path():
-    for name in ("latest.pt", "best.pt", "initial.pt"):
+    for name in ("latest.pt", "best.pt", "initial.pt", "epoch_050.pt"):
         path = SPATIAL_CHECKPOINT_DIR / name
         if path.is_file():
             return path

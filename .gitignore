@@ -7,3 +7,12 @@ backups
 deploy
 writeup
 checkpoints/experiments
+
+# Local model weights and training outputs
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+!/checkpoints/baseline_1.pt
+!/checkpoints/spatial/epoch_041.pt
+!/checkpoints/spatial/epoch_050.pt

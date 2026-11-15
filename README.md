@@ -67,7 +67,20 @@ python -c "import torch; from utae import UTAE; from alpaca.moc import Memory; f
 
 ### Data and checkpoints
 
-Installation does not download datasets or model weights. The app expects `checkpoints/spatial/epoch_050.pt`. Place that checkpoint there before running a forecast.
+The repository stores three FireForecaster checkpoints in Git LFS:
+
+- `checkpoints/spatial/epoch_050.pt` runs the app and is the fine-tuned model in the benchmark.
+- `checkpoints/baseline_1.pt` runs the initial baseline in the benchmark.
+- `checkpoints/spatial/epoch_041.pt` starts fine-tuning when a local training checkpoint is unavailable.
+
+Install Git LFS, then run these commands from the repository root if the model files were skipped during cloning:
+
+```bash
+git lfs install
+git lfs pull
+```
+
+Download the datasets and the third-party WSTS baseline checkpoint separately.
 
 For training, place raw TS-SatFire fire folders under `data/raw/ts-satfire/` and run:
 
