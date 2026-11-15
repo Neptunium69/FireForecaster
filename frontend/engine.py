@@ -19,7 +19,7 @@ ROOT = Path(os.environ.get("FIREFORECAST_ROOT", Path(__file__).resolve().parents
 sys.path.insert(0, str(ROOT))
 from prepare_data import FireDataset, has_fire_observation
 
-CHECKPOINT = ROOT / "data/checkpoints/spatial/epoch_050.pt"
+CHECKPOINT = ROOT / "checkpoints/spatial/epoch_050.pt"
 GPU_LOCK = threading.Lock()
 
 
