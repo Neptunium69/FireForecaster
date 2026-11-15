@@ -22,16 +22,20 @@ class FireForecast(nn.Module):
 
     def forward(self, history, dates, burned=None, *, spatial_cache=None, update_memory=True):
         bottleneck, skips = self.encoder(history, dates, spatial_cache=spatial_cache)
-        if self.memory is not None:
-            # Keep recurrent memory arithmetic in float32.
-            with torch.autocast(device_type=bottleneck.device.type, enabled=False):
-                if update_memory:
-                    transformed = self.memory(bottleneck.float())
-                else:
-                    transformed = self.memory.read(bottleneck.float())
-            bottleneck = transformed
-        fmap=self.decoder(bottleneck, skips)
-        return self.output(fmap,burned)
+        bottleneck = self.apply_memory(bottleneck, history[:, -1, 27:29], update_memory=update_memory)
+        return self.output(self.decoder(bottleneck, skips), burned)
+
+    def apply_memory(self, bottleneck, observed_fire_maps=None, *, update_memory=True):
+        if self.memory is None:
+            return bottleneck
+        # Keep recurrent memory arithmetic in float32.
+        with torch.autocast(device_type=bottleneck.device.type, enabled=False):
+            bottleneck = bottleneck.float()
+            if not update_memory:
+                return self.memory.read(bottleneck)
+            if isinstance(self.memory, MemoryAdapter):
+                return self.memory(bottleneck, observed_fire_maps)
+            return self.memory(bottleneck)
 
 class FireHistoryEncoder(nn.Module):
 
@@ -362,8 +366,7 @@ class AppendMemory(nn.Module):
 
         return torch.cat([features, memory], dim=1)
 
-
-class MemoryAdapter(nn.Module):
+class LegacyMemoryAdapter(nn.Module):
     """Use one shared SNN, with optional independent state for each map region."""
 
     def __init__(self, high, low, dims, size, device, shape,*, memory_key="encoder", steps=8, dt=0.005, input_gain=8.0, grid_size=None):
@@ -472,6 +475,82 @@ class MemoryAdapter(nn.Module):
             readout = readout.reshape(*self.grid_size, -1)
         readout = readout.unsqueeze(0)
         return bottleneck + self.memory_decoder((bottleneck, readout))
+
+class MemoryAdapter(nn.Module):
+    """Store spatial observation state using ALPACA's neuron step."""
+
+    width = 24
+    steps = 4
+    dt = 0.005
+
+    def __init__(self):
+        super().__init__()
+        self.fusion = nn.Sequential(
+            AppendMemory(),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+        )
+        self.fusion[0].projection.weight.requires_grad_(False)
+        self.drive = nn.Sequential(nn.Conv2d(130, self.width, 1), nn.GroupNorm(4, self.width))
+        self.recurrent = nn.Conv2d(self.width, self.width, 3, padding=1, bias=False)
+        self.readout = nn.Conv2d(2 * self.width, 128, 1, bias=False)
+        nn.init.normal_(self.recurrent.weight, std=0.01)
+        nn.init.zeros_(self.readout.weight)
+
+        self.cells = Memory(high=1., low=-1., dims=1, size=1, device="cpu", interval=1, shape={}, name="spatial_grid")
+        self.cells.input_mask.fill_(True)
+        self.cells.requires_grad_(False)
+        self.cells.threshold = 0.75
+        self.cells.tau = -self.dt / math.log(0.65)
+        self.state_shape = None
+
+    def reset_memory(self):
+        self.state_shape = None
+        self.cells.voltage = self.cells.voltage.new_zeros(1)
+        self.cells.spikes = self.cells.spikes.new_zeros(1)
+
+    def detach_memory(self):
+        self.cells.voltage = self.cells.voltage.detach()
+        self.cells.spikes = self.cells.spikes.detach()
+
+    def write(self, bottleneck, observed_fire_maps):
+        """Write a usable observation, using the last active and burned maps."""
+        if (observed_fire_maps is None or observed_fire_maps.ndim != 4
+                or observed_fire_maps.shape[:2] != (bottleneck.shape[0], 2)):
+            raise ValueError("observed_fire_maps must have shape [batch, 2, height, width]")
+        maps = torch.nan_to_num(observed_fire_maps.to(bottleneck), nan=0)
+        maps = F.adaptive_max_pool2d(maps, bottleneck.shape[-2:])
+        drive = self.drive(torch.cat((bottleneck, maps), dim=1)) * 1.5
+        if self.state_shape is None:
+            self.state_shape = drive.shape
+            self.cells.voltage = drive.new_zeros((1, drive.numel()))
+            self.cells.spikes = torch.zeros_like(self.cells.voltage)
+        elif self.state_shape != drive.shape:
+            raise ValueError("Reset spatial memory before writing observations on a different grid")
+        for _ in range(self.steps):
+            spikes = self.cells.spikes.reshape(self.state_shape)
+            current = drive + self.recurrent(spikes)
+            self.cells.step(current.flatten()[None], dt=self.dt)
+
+    def read(self, bottleneck):
+        """Read the held spatial state without advancing the ALPACA neurons."""
+        if self.state_shape is None:
+            state = bottleneck.new_zeros((bottleneck.shape[0], 2 * self.width, *bottleneck.shape[-2:]))
+        else:
+            if self.state_shape[0] != bottleneck.shape[0]:
+                raise ValueError("Reset spatial memory before changing the batch")
+            state = torch.cat((self.cells.voltage.reshape(self.state_shape),
+                               self.cells.spikes.reshape(self.state_shape)), dim=1)
+        location = self.readout(state) + self.fusion[0].projection.bias[None, :, None, None]
+        if location.shape[-2:] != bottleneck.shape[-2:]:
+            location = F.interpolate(location, size=bottleneck.shape[-2:], mode="bilinear", align_corners=False)
+        return bottleneck + self.fusion[1:](torch.cat((bottleneck, location), dim=1))
+
+    def forward(self, bottleneck, observed_fire_maps):
+        self.write(bottleneck, observed_fire_maps)
+        return self.read(bottleneck)
 
 class OutputModule(nn.Module):
     def __init__(self) -> None:

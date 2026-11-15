@@ -23,12 +23,18 @@ aux_bands={
 scales=np.array([100, 100, 100, 400, 400, 100, 400, 400,
                  *aux_bands.values()], dtype=np.float32)[:, None, None]
 
+
+def has_fire_observation(valid):
+    """Check the input validity mask for VIIRS I4 and both fire-map channels."""
+    return (valid[3].any() or valid[6].any()) and valid[27].any() and valid[28].any()
+
+
 class FireDataset:
-    def __init__(self, folder):
+    def __init__(self, folder, *, require_daily=True):
         self.folder=folder
         self.files=sorted((folder / "VIIRS_Day").glob("*.tif"))
         self.dates=np.array([p.name[:10] for p in self.files], dtype="datetime64[D]")
-        if not np.all(np.diff(self.dates)==np.timedelta64(1, "D")):
+        if require_daily and not np.all(np.diff(self.dates)==np.timedelta64(1, "D")):
             raise ValueError(f"{folder.name}: split missing-day gaps into separate sequences.")
         with rasterio.open(self.files[0]) as src:
             self.crs=src.crs

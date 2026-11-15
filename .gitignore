@@ -2,3 +2,7 @@ data
 __pycache__
 download.py
 *.py[cod]
+diagnostics
+backups
+deploy
+writeup
