@@ -1,3 +1,4 @@
+import math
 from typing import cast
 
 import torch
@@ -19,12 +20,15 @@ class FireForecast(nn.Module):
         self.decoder = UNetDecoder()
         self.output=OutputModule()
 
-    def forward(self, history, dates,burned=None):
-        bottleneck, skips = self.encoder(history, dates)
+    def forward(self, history, dates, burned=None, *, spatial_cache=None, update_memory=True):
+        bottleneck, skips = self.encoder(history, dates, spatial_cache=spatial_cache)
         if self.memory is not None:
             # Keep recurrent memory arithmetic in float32.
             with torch.autocast(device_type=bottleneck.device.type, enabled=False):
-                transformed = self.memory(bottleneck.float())
+                if update_memory:
+                    transformed = self.memory(bottleneck.float())
+                else:
+                    transformed = self.memory.read(bottleneck.float())
             bottleneck = transformed
         fmap=self.decoder(bottleneck, skips)
         return self.output(fmap,burned)
@@ -51,7 +55,13 @@ class FireHistoryEncoder(nn.Module):
         self.temporal_aggregator = utae.temporal_aggregator
         self.pad_value = utae.pad_value
 
-    def forward(self, history, dates):
+    def forward(self, history, dates, *, spatial_cache=None):
+        if spatial_cache is not None:
+            spatial_cache._prepare(history)
+            pad_mask = torch.stack(spatial_cache.padding[:history.shape[1]], dim=1)
+            if self.low_vram:
+                return self._aggregate_daily_maps(spatial_cache.daily_maps(history), dates, pad_mask)
+            return self._aggregate_maps(spatial_cache.feature_maps(history), dates, pad_mask)
         if self.low_vram:
             return self._forward_low_vram(history, dates)
         pad_mask = (history == self.pad_value).all(dim=(2, 3, 4))
@@ -63,16 +73,32 @@ class FireHistoryEncoder(nn.Module):
             features = down_block.smart_forward(features)
             feature_maps.append(features)
 
+        return self._aggregate_maps(feature_maps, dates, pad_mask)
+
+    def _aggregate_maps(self, feature_maps, dates, pad_mask):
         bottleneck, attention = self._attend_valid_history(
             feature_maps[-1], dates, pad_mask
         )
         skips = [
-            self.temporal_aggregator(
-                features, pad_mask=pad_mask, attn_mask=attention
-            )
+            self._aggregate_skip(features, pad_mask, attention)
             for features in reversed(feature_maps[:-1])
         ]
         return bottleneck, skips
+
+    @staticmethod
+    def _aggregate_skip(features, pad_mask, attention):
+        # Group channels with a view instead of copying the entire history per head.
+        heads, batch, length, height, width = attention.shape
+        weights = attention.reshape(heads * batch, length, height, width)
+        if features.shape[-2] > width:
+            weights = F.interpolate(weights, size=features.shape[-2:], mode="bilinear", align_corners=False)
+        else:
+            weights = F.avg_pool2d(weights, kernel_size=width // features.shape[-2])
+        weights = weights.reshape(heads, batch, length, *features.shape[-2:])
+        if pad_mask is not None and pad_mask.any():
+            weights = weights * (~pad_mask).float()[None, :, :, None, None]
+        grouped = features.reshape(batch, length, heads, features.shape[2] // heads, *features.shape[-2:])
+        return (grouped * weights.permute(1, 2, 0, 3, 4).unsqueeze(3)).sum(dim=1).flatten(1, 2)
 
     def _encode_day(self, frame, keep_on_gpu=False):
         frame = frame.to(next(self.parameters()).device)
@@ -123,6 +149,10 @@ class FireHistoryEncoder(nn.Module):
             if keep_on_gpu:
                 cached_bytes += frame_bytes
             maps.append(encoded)
+        return self._aggregate_daily_maps(maps, dates, pad_mask)
+
+    def _aggregate_daily_maps(self, maps, dates, pad_mask):
+        device = next(self.parameters()).device
         deepest = torch.stack([m[-1].to(device) for m in maps], dim=1)
         # Run attention once: it contains dropout and BatchNorm running statistics.
         bottleneck, attention = self._attend_valid_history(deepest, dates.to(device), pad_mask)
@@ -169,6 +199,118 @@ class FireHistoryEncoder(nn.Module):
         return torch.cat(outputs, dim=0), torch.cat(attentions, dim=1)
 
 
+
+class _CollectFeatureGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, features, accumulated, anchor):
+        ctx.accumulated = accumulated
+        return features
+
+    @staticmethod
+    def backward(ctx, gradient):
+        # Sum in float32 even when the forward used bfloat16.
+        ctx.accumulated.add_(gradient.to(ctx.accumulated))
+        return None, None, None
+
+
+class RolloutSpatialCache:
+    def __init__(self, encoder, batch_size=None, capacity=None, retain_activations=None):
+        self.encoder = encoder
+        self.device = next(encoder.parameters()).device
+        self.training = torch.is_grad_enabled()
+        self.anchor = torch.zeros((), device=self.device, requires_grad=self.training)
+        self.entries = []
+        self.gpu_bytes = 0
+        self.batch_size = batch_size or (1 if encoder.low_vram else 8)
+        self.capacity = capacity
+        self.banks = self.grad_banks = None
+        self.padding = []
+        self.retain_activations = not encoder.low_vram if retain_activations is None else retain_activations
+        self.retained = []
+        self.replay_start = 0
+
+    def _prepare(self, history):
+        self.autocast_enabled = torch.is_autocast_enabled(self.device.type)
+        self.autocast_dtype = torch.get_autocast_dtype(self.device.type)
+        retain_prefix = self.training and self.retain_activations and not self.entries
+        for start in range(len(self.entries), history.shape[1], self.batch_size):
+            stop = min(start + self.batch_size, history.shape[1])
+            batch = history[:, start:stop].reshape(-1, *history.shape[2:]).detach()
+            # Retain up to 32 observed frames; keep generated-frame replay batched.
+            retain = retain_prefix and stop <= 32
+            with torch.set_grad_enabled(retain):
+                encoded = self.encoder._encode_day(batch, keep_on_gpu=True)
+            if retain:
+                self.retained.append((start, stop, encoded))
+                self.replay_start = stop
+            if self.capacity is not None and not self.encoder.low_vram and self.banks is None:
+                self.banks = tuple(x.new_empty(history.shape[0], self.capacity, *x.shape[1:]) for x in encoded)
+                if self.training:
+                    self.grad_banks = tuple(torch.zeros_like(x, dtype=torch.float32 if x.element_size() < 4 else x.dtype) for x in self.banks)
+            for offset, day in enumerate(range(start, stop)):
+                frame = history[:, day].detach()
+                maps = tuple(x.detach().reshape(history.shape[0], stop-start, *x.shape[1:])[:, offset] for x in encoded)
+                byte_count = sum(x.numel() * (x.element_size() + (max(4, x.element_size()) if self.training else 0)) for x in maps)
+                on_gpu = not self.encoder.low_vram or self.gpu_bytes + byte_count <= self.encoder.gpu_cache_bytes
+                storage = self.device if on_gpu else torch.device("cpu")
+                if self.banks is not None:
+                    for bank, features in zip(self.banks, maps):
+                        bank[:, day].copy_(features)
+                    maps = tuple(bank[:, day] for bank in self.banks)
+                    gradients = tuple(bank[:, day] for bank in self.grad_banks) if self.training else None
+                else:
+                    maps = tuple(x.to(storage) for x in maps)
+                    gradients = tuple(torch.zeros_like(x, dtype=torch.float32 if x.element_size() < 4 else x.dtype) for x in maps) if self.training else None
+                self.padding.append((frame == self.encoder.pad_value).all(dim=(1, 2, 3)).to(self.device))
+                self.entries.append((frame, maps, gradients))
+                if on_gpu:
+                    self.gpu_bytes += byte_count
+
+    def daily_maps(self, history):
+        self._prepare(history)
+        days = []
+        for _, maps, gradients in self.entries[:history.shape[1]]:
+            day = []
+            for level, features in enumerate(maps):
+                if self.training:
+                    features = _CollectFeatureGradient.apply(features, gradients[level], self.anchor)
+                day.append(features)
+            days.append(tuple(day))
+        return days
+
+    def feature_maps(self, history):
+        self._prepare(history)
+        if self.banks is not None:
+            length = history.shape[1]
+            if self.training:
+                return [_CollectFeatureGradient.apply(x[:, :length], g[:, :length], self.anchor) for x, g in zip(self.banks, self.grad_banks)]
+            return [x[:, :length] for x in self.banks]
+        days = self.daily_maps(history)
+        return [torch.stack([day[level].to(self.device) for day in days], dim=1) for level in range(4)]
+
+    def backward(self):
+        for start, stop, encoded in self.retained:
+            entries = self.entries[start:stop]
+            gradients = tuple(torch.stack([entry[2][level].to(self.device) for entry in entries], dim=1).flatten(0, 1) for level in range(4))
+            torch.autograd.backward(encoded, gradients)
+        self.retained.clear()
+        for start in range(self.replay_start, len(self.entries), self.batch_size):
+            entries = self.entries[start:start+self.batch_size]
+            frames = torch.cat([entry[0] for entry in entries], dim=0)
+            with torch.autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_enabled):
+                encoded = self.encoder._encode_day(frames, keep_on_gpu=True)
+            gradients = tuple(torch.cat([entry[2][level].to(self.device) for entry in entries], dim=0) for level in range(4))
+            torch.autograd.backward(encoded, gradients)
+
+    def clear(self):
+        self.entries.clear()
+        self.padding.clear()
+        self.retained.clear()
+        self.replay_start = 0
+        self.banks = self.grad_banks = None
+        self.gpu_bytes = 0
+
+
 class UNetDecoderBlock(nn.Module):
     def __init__(self, input_channels, skip_channels, output_channels):
         super().__init__()
@@ -211,22 +353,35 @@ class AppendMemory(nn.Module):
 
     def forward(self, inputs):
         features, memory = inputs
-        height, width = features.shape[-2:]
-        memory = self.projection(memory)[:, :, None, None]
-        memory = memory.expand(-1, -1, height, width)
+        memory = self.projection(memory)
+        if memory.ndim == 2:
+            memory = memory[:, :, None, None].expand(-1, -1, *features.shape[-2:])
+        else:
+            memory = memory.permute(0, 3, 1, 2)
+            memory = F.interpolate(memory, size=features.shape[-2:], mode="bilinear", align_corners=False)
 
         return torch.cat([features, memory], dim=1)
 
 
 class MemoryAdapter(nn.Module):
-    def __init__(self, high, low, dims, size, device, shape,*, memory_key="encoder", steps=8, dt=0.005,):
+    """Use one shared SNN, with optional independent state for each map region."""
+
+    def __init__(self, high, low, dims, size, device, shape,*, memory_key="encoder", steps=8, dt=0.005, input_gain=8.0, grid_size=None):
         super().__init__()
+        if grid_size is not None:
+            grid_size = tuple(grid_size)
+        self.grid_size = grid_size
         self.memory = Memory(
             high, low, dims, size, device, interval=1, shape=shape, name="memory"
         )
+        if grid_size is not None:
+            state_shape = (math.prod(grid_size), size)
+            self.memory.voltage = self.memory.voltage.new_zeros(state_shape)
+            self.reset_memory()
         self.memory_key = memory_key
         self.steps = steps
         self.dt = dt
+        self.input_gain = input_gain
         self.encoder_encoder = nn.Sequential(
             nn.Conv2d(128, 64, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
@@ -254,17 +409,68 @@ class MemoryAdapter(nn.Module):
         )
         self.to(device)
 
+    def reset_memory(self):
+        """Start a new fire with zero voltage and spikes in every region."""
+        memory = self.memory
+        memory.voltage = torch.zeros_like(memory.voltage)
+        memory.spikes = torch.zeros_like(memory.voltage)
+        memory.y = {
+            key: memory.voltage.new_zeros((*memory.voltage.shape[:-1], width))
+            for key, width in memory.shape.items()
+        }
+
+    def detach_memory(self):
+        """Keep the stored state while ending its autograd history."""
+        memory = self.memory
+        memory.voltage = memory.voltage.detach()
+        memory.spikes = memory.spikes.detach()
+        memory.y = {key: value.detach() for key, value in memory.y.items()}
+
+    def _regions(self, bottleneck):
+        if self.grid_size is None:
+            return bottleneck
+        rows, cols = self.grid_size
+        height, width = bottleneck.shape[-2:]
+        tile_h, tile_w = math.ceil(height / rows), math.ceil(width / cols)
+        divisible_size = (rows * tile_h, cols * tile_w)
+        if divisible_size != (height, width):
+            bottleneck = F.interpolate(bottleneck, size=divisible_size, mode="bilinear", align_corners=False)
+        channels = bottleneck.shape[1]
+        tiles = bottleneck[0].reshape(channels, rows, tile_h, cols, tile_w)
+        return tiles.permute(1, 3, 0, 2, 4).reshape(rows * cols, channels, tile_h, tile_w)
+
     def forward(self, bottleneck):
-        encoded = self.encoder_encoder(bottleneck)
+        encoded = self.encoder_encoder(self._regions(bottleneck))
         input_slice = self.memory.input_slices[self.memory_key]
         output_slice = self.memory.output_slices[self.memory_key]
         for _ in range(self.steps):
-            readout = self.memory.voltage[output_slice].unsqueeze(0)
+            readout = self.memory.voltage[..., output_slice].reshape(encoded.shape[0], -1)
             new_input = self.encoder_encoder_mlp(torch.cat([encoded, readout], dim=1))
             stimulus = torch.zeros_like(self.memory.voltage)
-            stimulus[input_slice] = new_input[0].to(stimulus)
-            self.memory.step(stimulus, dt=self.dt)
-        readout = self.memory.voltage[output_slice].unsqueeze(0)
+            stimulus[..., input_slice] = new_input.reshape(stimulus[..., input_slice].shape).to(stimulus)
+            if self.grid_size is None:
+                self.memory.step(stimulus * self.input_gain, dt=self.dt)
+            else:
+                # ALPACA accepts one state vector at a time; keep regions independent.
+                memory = self.memory
+                voltages, spikes = memory.voltage, memory.spikes
+                states, outputs = [], []
+                for region in range(len(voltages)):
+                    memory.voltage, memory.spikes = voltages[region], spikes[region]
+                    memory.step(stimulus[region] * self.input_gain, dt=self.dt)
+                    states.append((memory.voltage, memory.spikes))
+                    outputs.append(memory.y)
+                memory.voltage = torch.stack([v for v, _ in states])
+                memory.spikes = torch.stack([s for _, s in states])
+                memory.y = {key: torch.stack([y[key] for y in outputs]) for key in memory.shape}
+        return self.read(bottleneck)
+
+    def read(self, bottleneck):
+        output_slice = self.memory.output_slices[self.memory_key]
+        readout = self.memory.voltage[..., output_slice]
+        if self.grid_size is not None:
+            readout = readout.reshape(*self.grid_size, -1)
+        readout = readout.unsqueeze(0)
         return bottleneck + self.memory_decoder((bottleneck, readout))
 
 class OutputModule(nn.Module):

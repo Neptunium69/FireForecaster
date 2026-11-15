@@ -43,21 +43,27 @@ from model import FireForecast, MemoryAdapter
 
 adapter = MemoryAdapter(
     high=1.0, low=-1.0, dims=3, size=4096, device="cuda",
-    shape={"encoder": 512}, steps=8,
+    shape={"encoder": 512}, steps=8, grid_size=(4, 4),
 )
-model = FireForecast(input_channels=12, memory_adapter=adapter).cuda()
+model = FireForecast(input_channels=58, memory=adapter).cuda()
 adapter.reset_memory()  # Start of an independent fire sequence
-features = model(history, dates)
+active, burned, new = model(history, dates, update_memory=observation_available)
 ```
 
 `history` is `[B,T,C,H,W]`, with H and W at least 16. `dates` is `[B,T]`.
 ALPACA's current memory supports B=1. The encoder/decoder alone supports larger
 batches: use `FireForecast(input_channels=12)` without an adapter.
 
-The memory adapter compresses the 128-channel bottleneck into 512 values, runs
-feedback-controlled memory steps, and fuses the resulting readout back into the
-bottleneck before decoding. State persists across calls. Reset between independent
-fires; call `adapter.detach_memory()` at truncated-backpropagation boundaries.
+Without `grid_size`, the adapter compresses the bottleneck into one vector and
+broadcasts its readout. With a grid, it applies the same ALPACA SNN and encoder
+to each region. Voltage and spikes are separate for each region. The original
+projection and fusion layers combine these readouts with the corresponding
+locations before decoding. Both modes accept the same model checkpoint.
+
+State persists across calls. Pass `update_memory=False` during observation gaps
+or when issuing forecasts without a new observation. The decoder still receives
+the stored state. Reset between independent fires or changes in the reference
+grid. Call `adapter.detach_memory()` at truncated-backpropagation boundaries.
 Memory dynamics currently use FP32; mixed-precision training has not been validated.
 ALPACA's development package must also be installed in the training environment.
 
@@ -115,8 +121,9 @@ No new reserved test fires are used.
 
 WSTS code and statistics: https://github.com/slahrichi/WildfireSpreadTS
 commit `ed221d491fe2142a4b2e93462c2c0b7a1c7c31ad`. The fold-1 checkpoint
-trained on 2018/2019, validated on 2021, and tested on 2020. Backbone source
-is included in `wsts_backbones/` with its MIT license. Original input archive:
+trained on 2018/2019, validated on 2021, and tested on 2020. The baseline reuses
+the installed U-TAE dependency, which includes its MIT license; no duplicate
+backbone source is needed. Original input archive:
 https://doi.org/10.5281/zenodo.8006177.
 
 Released WSTS weights: https://huggingface.co/saadlahrichi/WSTSPlus/blob/main/trained_model_weights/Res18UTAE_T5/All/fold1_testAP0.420.pth

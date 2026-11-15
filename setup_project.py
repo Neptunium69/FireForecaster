@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 UPSTREAM_COMMIT = "987874e27a98bb399277f2d55eb010744d26f881"
 PACKAGE_NAME = "fireforecaster-utae"
-PACKAGE_VERSION = "0.1.0+987874e27a98"
+PACKAGE_VERSION = "0.1.1+987874e27a98"
 UPSTREAM_FILES = {
     "src/backbones/utae.py": "c0f33cc875713cb348d25c4be8dac2435464bf81960c8288a7ed5f5718417f93",
     "src/backbones/ltae.py": "e358812f75eb1d74a5607a7d4bd28538241a5a215b0b67eefa59b7ea457bc36e",
@@ -70,6 +70,11 @@ def install_utae() -> None:
                 continue
             # Package-local imports replace the upstream experiment repo's src namespace.
             text = text.replace("from src.backbones.", "from .")
+            if relative_path.endswith("ltae.py"):
+                text = text.replace(
+                    "torch.stack([self.Q for _ in range(sz_b)], dim=1).view(",
+                    "self.Q[:, None, :].expand(-1, sz_b, -1).reshape(",
+                )
             (package / Path(relative_path).name).write_text(text, encoding="utf-8")
 
         (package / "__init__.py").write_text(
@@ -80,7 +85,8 @@ def install_utae() -> None:
             "Source: https://github.com/VSainteuf/utae-paps\n"
             f"Commit: {UPSTREAM_COMMIT}\n"
             "Copyright (c) 2021 VSainteuf. MIT license included.\n\n"
-            "Changes: package-relative imports and an export in __init__.py.\n"
+            "Changes: package-relative imports, an export in __init__.py, and\n"
+            "tensor expansion instead of per-pixel attention-query copies.\n"
             "Model calculations are unchanged. This distribution is a local\n"
             "packaging wrapper, not an official upstream PyPI release.\n"
             "Paper: https://arxiv.org/abs/2107.07933\n",
