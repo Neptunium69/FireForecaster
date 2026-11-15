@@ -6,14 +6,15 @@ import torch.nn.functional as F
 from utae import UTAE
 from utae.utae import DownConvBlock
 from alpaca.moc import Memory
+from torch.utils.checkpoint import checkpoint
 
 
 class FireForecast(nn.Module):
     """Encode history, optionally transform it with memory, then decode features."""
 
-    def __init__(self, input_channels, memory=None):
+    def __init__(self, input_channels, memory=None, *, low_vram=False, gpu_cache_gb=5.0):
         super().__init__()
-        self.encoder = FireHistoryEncoder(input_channels)
+        self.encoder = FireHistoryEncoder(input_channels, low_vram=low_vram, gpu_cache_gb=gpu_cache_gb)
         self.memory = memory
         self.decoder = UNetDecoder()
         self.output=OutputModule()
@@ -21,15 +22,19 @@ class FireForecast(nn.Module):
     def forward(self, history, dates,burned=None):
         bottleneck, skips = self.encoder(history, dates)
         if self.memory is not None:
-            transformed = self.memory(bottleneck)
+            # Keep recurrent memory arithmetic in float32.
+            with torch.autocast(device_type=bottleneck.device.type, enabled=False):
+                transformed = self.memory(bottleneck.float())
             bottleneck = transformed
         fmap=self.decoder(bottleneck, skips)
         return self.output(fmap,burned)
 
 class FireHistoryEncoder(nn.Module):
 
-    def __init__(self, input_channels):
+    def __init__(self, input_channels, *, low_vram=False, gpu_cache_gb=5.0):
         super().__init__()
+        self.low_vram = low_vram
+        self.gpu_cache_bytes = int(gpu_cache_gb * 1024**3)
         utae = UTAE(
             input_dim=input_channels,
             encoder_widths=[32, 32, 64, 128],
@@ -47,6 +52,8 @@ class FireHistoryEncoder(nn.Module):
         self.pad_value = utae.pad_value
 
     def forward(self, history, dates):
+        if self.low_vram:
+            return self._forward_low_vram(history, dates)
         pad_mask = (history == self.pad_value).all(dim=(2, 3, 4))
 
         features = self.in_conv.smart_forward(history)
@@ -65,6 +72,71 @@ class FireHistoryEncoder(nn.Module):
             )
             for features in reversed(feature_maps[:-1])
         ]
+        return bottleneck, skips
+
+    def _encode_day(self, frame, keep_on_gpu=False):
+        frame = frame.to(next(self.parameters()).device)
+        padded = (frame == self.pad_value).all(dim=(1, 2, 3))[:, None, None, None]
+        features = self.in_conv(frame).masked_fill(padded, self.pad_value)
+        maps = [features if keep_on_gpu else features.cpu()]
+        for block in self.down_blocks:
+            features = block(features).masked_fill(padded, self.pad_value)
+            maps.append(features if keep_on_gpu else features.cpu())
+        return tuple(maps)
+
+    @staticmethod
+    def _weight_day(features, attention, valid):
+        # Same att_group calculation, with only one day's spatial maps on GPU.
+        features = features.to(attention.device)
+        heads, batch, height, width = attention.shape
+        weights = attention.reshape(heads * batch, 1, height, width)
+        if features.shape[-2] > width:
+            weights = F.interpolate(weights, size=features.shape[-2:],
+                                    mode="bilinear", align_corners=False)
+        else:
+            weights = F.avg_pool2d(weights, kernel_size=width // features.shape[-2])
+        weights = weights.reshape(heads, batch, 1, *features.shape[-2:])
+        weights = weights * valid[None, :, None, None, None]
+        groups = torch.stack(features.chunk(heads, dim=1))
+        return torch.cat(list(groups * weights), dim=1)
+
+    def _forward_low_vram(self, history, dates):
+        device = next(self.parameters()).device
+        pad_mask = (history == self.pad_value).all(dim=(2, 3, 4)).to(device)
+        maps = []
+        cached_bytes = 0
+        frame_bytes = 0
+        for day in range(history.shape[1]):
+            frame = history[:, day]
+            if frame.shape[0] == 1:
+                # Keep batch stride fixed as history grows, without copying data.
+                frame = frame[0].unsqueeze(0)
+            # Keep a bounded feature cache on GPU; spill longer histories to CPU.
+            keep_on_gpu = frame_bytes > 0 and cached_bytes + frame_bytes <= self.gpu_cache_bytes
+            # Retain the first four days; recompute later CNN activations during backward.
+            if self.training and torch.is_grad_enabled() and day >= 4:
+                # Checkpoint only pure CNN work, never stateful memory or attention.
+                encoded = checkpoint(self._encode_day, frame, keep_on_gpu, use_reentrant=False)
+            else:
+                encoded = self._encode_day(frame, keep_on_gpu)
+            frame_bytes = sum(level.numel() * level.element_size() for level in encoded)
+            if keep_on_gpu:
+                cached_bytes += frame_bytes
+            maps.append(encoded)
+        deepest = torch.stack([m[-1].to(device) for m in maps], dim=1)
+        # Run attention once: it contains dropout and BatchNorm running statistics.
+        bottleneck, attention = self._attend_valid_history(deepest, dates.to(device), pad_mask)
+        skips = []
+        for level in (2, 1, 0):
+            total = None
+            for day, encoded in enumerate(maps):
+                args = (encoded[level], attention[:, :, day], ~pad_mask[:, day])
+                if self.training and torch.is_grad_enabled():
+                    weighted = checkpoint(self._weight_day, *args, use_reentrant=False)
+                else:
+                    weighted = self._weight_day(*args)
+                total = weighted if total is None else total + weighted
+            skips.append(total)
         return bottleneck, skips
 
     def _attend_valid_history(self, features, dates, pad_mask):
@@ -212,14 +284,14 @@ class OutputModule(nn.Module):
         logits=None
         if burned is None:
             logits=self.existing_head(features)
-            burned = torch.sigmoid(logits)
+            burned = torch.sigmoid(logits.float())
         
         transformed=self.merger(torch.cat([features,burned],dim=1))
         logits_onfire=self.fire_head(transformed)
         logits_burnt=self.burned_head(transformed)
 
-        onfire=torch.sigmoid(logits_onfire)
-        burnt=torch.sigmoid(logits_burnt)
+        onfire=torch.sigmoid(logits_onfire.float())
+        burnt=torch.sigmoid(logits_burnt.float())
 
         new = (1 - burned) * burnt
         burned =burned + new

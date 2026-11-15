@@ -121,3 +121,22 @@ https://doi.org/10.5281/zenodo.8006177.
 
 Released WSTS weights: https://huggingface.co/saadlahrichi/WSTSPlus/blob/main/trained_model_weights/Res18UTAE_T5/All/fold1_testAP0.420.pth
 Save this file locally as `data/baselines/wsts_fold1.pt`.
+
+## Lower-VRAM training
+
+`train.ipynb` enables `low_vram=True`. The spatial encoder processes one full-size
+day at a time, checkpoints its pure CNN operations, and stores saved tensors in
+system RAM with PyTorch `save_on_cpu`. Temporal attention still sees the entire
+history. Stateful ALPACA memory and BatchNorm are evaluated once per forecast.
+The low-VRAM loader avoids worker prefetch copies of large histories.
+
+This trades extra computation and CPU/GPU transfers for lower VRAM use. Existing
+model and optimizer checkpoints remain compatible. Tests of the actual notebook
+step with 63 and 64 history days at 596x595 passed forward, backward and optimizer
+updates, peaking at about 5.2 GiB allocated VRAM, 5.7 GiB reserved VRAM and 19.1 GiB
+process RAM. Results are in `data/evaluation/low_vram/verification.json`. Reload the
+updated notebook and model before restarting training from its existing checkpoint.
+
+This run still trains on growing observed histories. The planned third training
+run (second fine-tune) will introduce short recursive rollouts; it is not enabled
+by this memory optimization.
