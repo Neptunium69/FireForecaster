@@ -37,16 +37,17 @@ from engine import (CHECKPOINT, load_fire, save_uploads, read_points,
 MAP_HTML = r'''
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><style>
-*{box-sizing:border-box}body{margin:0;color:#eee;background:#171614;font:14px system-ui,sans-serif}
+*{box-sizing:border-box}html,body{width:100%;height:100%;overflow-x:hidden}body{display:flex;flex-direction:column;margin:0;color:#eee;background:#171614;font:14px system-ui,sans-serif}
 .row{display:flex;align-items:center;gap:12px;margin:8px 0;flex-wrap:wrap}
 input[type=range]{width:100%;accent-color:#ec744a;margin:10px 0;cursor:pointer}
 select,button,input:not([type=range]){font:inherit;color:#eee;background:#292723;border:1px solid #595651;border-radius:5px;padding:6px 10px}
 button[aria-pressed=true]{border-color:#69f1ff;color:#69f1ff}
-#pointForm{position:absolute;left:12px;top:12px;background:#242220;border:1px solid #888;border-radius:6px;padding:14px;width:290px;z-index:2}
+#pointForm{position:absolute;left:12px;top:12px;background:#242220;border:1px solid #888;border-radius:6px;padding:14px;width:min(290px,calc(100% - 24px));max-height:calc(100% - 24px);overflow-y:auto;z-index:2}
 #pointForm label{display:block;margin:8px 0}#pointForm input{display:block;width:100%;margin-top:3px}#pointMessage{color:#ffd293}
 button{cursor:pointer}button:focus-visible,select:focus-visible,input:focus-visible,canvas:focus-visible{outline:2px solid #72e4ef}
-#date{margin-left:auto;font-variant-numeric:tabular-nums}#stage{position:relative;height:470px}
-#map{display:block;width:100%;height:100%;touch-action:none;cursor:grab;background:#171614}
+#date{margin-left:auto;font-variant-numeric:tabular-nums}#stage{position:relative;flex:1;min-height:160px}
+body>label,.row,#day,#legend,.hint{flex-shrink:0}select{max-width:100%}
+#map{display:block;width:100%;height:100%;touch-action:pan-y;cursor:grab;background:#171614}
 #tip{position:absolute;pointer-events:none;background:#161616eF;border:1px solid #666;padding:7px;max-width:260px;display:none;white-space:pre-line}
 #legend{width:100%;height:43px;display:block}.hint{font-size:12px;color:#c4bfb9;margin:5px 0}
 </style></head><body>
@@ -56,14 +57,14 @@ button{cursor:pointer}button:focus-visible,select:focus-visible,input:focus-visi
 <option value="burned">Cumulative burned</option><option value="active">Active fire</option><option value="new">Newly burned</option>
 </select><button id="zoomIn" aria-label="Zoom in">+</button><button id="zoomOut" aria-label="Zoom out">−</button>
 <button id="reset">Reset view</button><button id="addPoint" aria-pressed="false">Add point</button><span id="date" aria-live="polite">Loading map…</span></div>
-<div id="stage"><canvas id="map" tabindex="0" aria-label="Wildfire forecast map. Drag to pan, scroll to zoom. Arrow keys pan; plus and minus zoom."></canvas><div id="tip"></div>
+<div id="stage"><canvas id="map" tabindex="0" aria-label="Wildfire forecast map. Drag to pan, Ctrl+scroll to zoom. Arrow keys pan; plus and minus zoom."></canvas><div id="tip"></div>
 <form id="pointForm" hidden><strong>New point of interest</strong>
 <label for="pointName">Location name<input id="pointName" required maxlength="100"></label>
 <label for="pointValue">Protection value (1–10)<input id="pointValue" type="number" min="1" max="10" step="1" value="5" required></label>
 <label for="pointRadius">Buffer radius (km)<input id="pointRadius" type="number" min="0.1" max="20" step="0.1" value="2" required></label>
 <p id="pointMessage" role="status"></p><button type="submit">Save point</button> <button id="cancelPoint" type="button">Cancel</button></form></div>
 <canvas id="legend" aria-label="Nonlinear square-root score legend"></canvas>
-<p class="hint">Nonlinear scale  |  Model score 0–1  |  Cyan: your locations</p>
+<p class="hint">Nonlinear scale  |  Model score 0–1  |  Ctrl+scroll to zoom</p>
 <script>
 const data=__PAYLOAD__;
 const day=document.querySelector('#day'), layer=document.querySelector('#layer'), label=document.querySelector('#date');
@@ -115,7 +116,7 @@ new ResizeObserver(()=>{const rect=canvas.getBoundingClientRect(),oldW=cw,oldH=c
  else{ox+=(cw-oldW)/2;oy+=(ch-oldH)/2;queueDraw();}legend();}).observe(canvas);
 day.addEventListener('input',selectFrame);layer.addEventListener('change',selectFrame);
 document.querySelector('#reset').onclick=fit;document.querySelector('#zoomIn').onclick=()=>magnify(1.3);document.querySelector('#zoomOut').onclick=()=>magnify(1/1.3);
-canvas.addEventListener('wheel',e=>{e.preventDefault();magnify(Math.exp(-e.deltaY*.001),e.offsetX,e.offsetY);},{passive:false});
+canvas.addEventListener('wheel',e=>{if(!e.ctrlKey)return;e.preventDefault();magnify(Math.exp(-e.deltaY*.001),e.offsetX,e.offsetY);},{passive:false});
 function setAdding(value){adding=value;addButton.setAttribute('aria-pressed',value);addButton.textContent=value?'Click a location':'Add point';canvas.style.cursor=value?'crosshair':'grab';}
 function cancelPoint(){candidate=null;pointForm.hidden=true;setAdding(false);queueDraw();}
 addButton.onclick=()=>{if(adding)cancelPoint();else setAdding(true);};
@@ -147,9 +148,12 @@ loadImage(data.background).then(image=>{background=image;return selectFrame();})
 
 map_component = st.components.v2.component(
     "pips_clickable_map",
-    html='<iframe title="Interactive wildfire prediction monitor" style="width:100%;height:660px;border:0"></iframe>',
+    html='<iframe title="Interactive wildfire prediction monitor" style="display:block;width:100%;height:520px;border:0"></iframe>',
     js="""export default function({data,parentElement,setTriggerValue}) {
         const frame=parentElement.querySelector('iframe');
+        const resize=()=>{frame.style.height=Math.min(660,Math.max(320,window.innerHeight-180))+'px';};
+        resize();
+        window.addEventListener('resize',resize);
         if(frame.srcdoc!==data.html) frame.srcdoc=data.html;
         const receive=event=>{
             if(event.source===frame.contentWindow && event.data?.type==='pips:point-added'
@@ -157,7 +161,7 @@ map_component = st.components.v2.component(
                 setTriggerValue('point_added',event.data.point);
         };
         window.addEventListener('message',receive);
-        return ()=>window.removeEventListener('message',receive);
+        return ()=>{window.removeEventListener('message',receive);window.removeEventListener('resize',resize);};
     }""",
 )
 

@@ -5,7 +5,7 @@
 - `train.ipynb`, `test.ipynb`: training and evaluation entry points.
 - `model.py`, `checkpointing.py`: architecture and checkpoint loading.
 - `prepare_data.py`, `download.py`: dataset preparation and download utilities.
-- `evaluate_baselines.py`, `recursive_fire.py`, `wsts_baseline.py`: evaluation helpers.
+- `wsts_baseline.py`: WSTS input downloader.
 - `data/`, `checkpoints/`, and root `.pt` files: datasets and existing model weights.
 - `diagnostics/`: experiment scripts, archived logs, the results PDF, and one-off files.
 - `diagnostics/backups/runpod-2026-11-15/`: verified Pod backup, including epoch 41.
@@ -108,9 +108,12 @@ and `baseline_1.pt` FireForecaster checkpoints, and the WSTS checkpoint at
 `data/baselines/wsts_fold1.pt`. Install the optional WSTS dependencies with
 `python -m pip install -r requirements-baselines.txt`.
 
-The earlier one-day validation comparison runs through `evaluate_baselines.py`.
-Pass `checkpoint=Path("baseline_1.pt")` to `evaluate()` to use the historical
-checkpoint in that comparison.
+The notebook contains the evaluation code, including the earlier one-day and
+single-fire validation experiments. Run their optional calls at the end of
+the notebook to reproduce them. Pass `checkpoint=Path("baseline_1.pt")` to
+`evaluate_one_day()` to use the historical checkpoint in the one-day comparison.
+The older Python entry points load the same definitions from the notebook.
+
 The one-time `python wsts_baseline.py --download` command retrieves only 55
 original WSTS daily rasters (189 MB transferred), skips completed files, and
 refuses servers that ignore byte-range requests. Inputs are already downloaded
