@@ -6,6 +6,8 @@ FireForecaster predicts how a wildfire may spread and recommends which user-sele
 
 The model recursively predicts active fire, cumulative burned area, and newly burned area from the available observation history. Each predicted active-fire and burned-area map becomes part of the next day's input. The app combines these forecasts with custom points of interest and protection values to produce a ranked list and a plain-language recommendation.
 
+![Results of the benchmark](modelperformance.png)
+
 The main entry points are:
 
 | File | Purpose |
